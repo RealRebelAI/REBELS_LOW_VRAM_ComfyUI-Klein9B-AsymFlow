@@ -48,6 +48,7 @@ https://huggingface.co/black-forest-labs/FLUX.2-klein-9B/blob/main/flux-2-klein-
 
 
 - gguf model - /models/unet/
+- 
 https://huggingface.co/unsloth/FLUX.2-klein-9B-GGUF/tree/main
 
 
