@@ -43,6 +43,7 @@ def _get_dtype(name: str):
         "bfloat16": torch.bfloat16,
         "float16": torch.float16,
         "float32": torch.float32,
+        "fp8_e4m3fn": torch.float8_e4m3fn,
     }[name]
 
 
@@ -100,13 +101,13 @@ class AsymFlux2KleinLoader:
             },
             "optional": {
                 "dtype": (
-                    ["bfloat16", "float16", "float32"],
-                    {"default": "bfloat16"},
+                    ["bfloat16", "float16", "float32", "fp8_e4m3fn"],
+                    {"default": "fp8_e4m3fn"},
                 ),
                 "device": (["cuda", "mps", "cpu"], {"default": "cuda"}),
                 "enable_cpu_offload": (
                     "BOOLEAN",
-                    {"default": False, "label_on": "True", "label_off": "False"},
+                    {"default": True, "label_on": "True", "label_off": "False"},
                 ),
             },
         }
@@ -127,9 +128,9 @@ class AsymFlux2KleinLoader:
         transformer,
         text_encoder,
         adapter,
-        dtype="bfloat16",
+        dtype="fp8_e4m3fn",
         device="cuda",
-        enable_cpu_offload=False,
+        enable_cpu_offload=True,
     ):
         transformer_path = folder_paths.get_full_path("diffusion_models", transformer)
         adapter_path = folder_paths.get_full_path("loras", adapter)
@@ -247,8 +248,7 @@ class AsymFlux2KleinLoader:
         # Force pipeline and underlying modules (like VAE) into target precision
         pipe = pipe.to(dtype=torch_dtype)
 
-        # Bulletproof Pre-Hook: Catches any floating point tensor trying to enter the transformer 
-        # and rigorously forces it to match the transformer's dtype (prevents matrix crash)
+        # Bulletproof Pre-Hook
         def _pre_hook(module, args, kwargs):
             target_dtype = module.dtype
             new_args = tuple(
@@ -263,7 +263,7 @@ class AsymFlux2KleinLoader:
             
         pipe.transformer.register_forward_pre_hook(_pre_hook, with_kwargs=True)
 
-        # --- Clean up meta tensors before offload/device transfer ---
+        # Clean up meta tensors
         for module in pipe.transformer.modules():
             for name, param in module.named_parameters(recurse=False):
                 if param is not None and param.device.type == "meta":
@@ -274,11 +274,18 @@ class AsymFlux2KleinLoader:
                 if buffer is not None and buffer.device.type == "meta":
                     new_buffer = torch.zeros_like(buffer, device="cpu", dtype=torch_dtype)
                     module.register_buffer(name, new_buffer)
-        # -------------------------------------------------------------
 
-        # 8. Move to device
+        # 8. Move to device safely using sequential offload to bypass 18GB -> 8GB limits
         if enable_cpu_offload:
-            pipe.enable_model_cpu_offload()
+            try:
+                pipe.enable_sequential_cpu_offload()
+            except Exception as e:
+                logger.warning(f"Sequential offload failed, falling back to model offload: {e}")
+                try:
+                    pipe.enable_model_cpu_offload()
+                except Exception as e2:
+                    logger.warning(f"All offloading failed, forcing device transfer: {e2}")
+                    pipe = pipe.to(device)
         else:
             pipe = pipe.to(device)
 
@@ -384,15 +391,7 @@ class AsymFlux2KleinSampler:
 
 
 class AsymFlux2KleinLoaderNoCLIP:
-    """Load the AsymFLUX.2 klein pixel pipeline WITHOUT a text encoder.
-
-    Use this when you want to provide your own CONDITIONING from an external
-    CLIP/GGUF loader (e.g. ComfyUI-GGUF CLIPLoader + CLIPTextEncode).
-
-    - Transformer .safetensors from models/diffusion_models/
-    - Adapter .safetensors from models/loras/
-    - NO text encoder — conditioning comes from external nodes
-    """
+    """Load the AsymFLUX.2 klein pixel pipeline WITHOUT a text encoder."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -405,8 +404,8 @@ class AsymFlux2KleinLoaderNoCLIP:
             },
             "optional": {
                 "dtype": (
-                    ["bfloat16", "float16", "float32"],
-                    {"default": "bfloat16"},
+                    ["bfloat16", "float16", "float32", "fp8_e4m3fn"],
+                    {"default": "fp8_e4m3fn"},
                 ),
                 "device": (["cuda", "mps", "cpu"], {"default": "cuda"}),
             },
@@ -424,7 +423,7 @@ class AsymFlux2KleinLoaderNoCLIP:
         "Adapter: models/loras/ (.safetensors)"
     )
 
-    def load(self, transformer, adapter, dtype="bfloat16", device="cuda"):
+    def load(self, transformer, adapter, dtype="fp8_e4m3fn", device="cuda"):
         transformer_path = folder_paths.get_full_path("diffusion_models", transformer)
         adapter_path = folder_paths.get_full_path("loras", adapter)
 
@@ -514,11 +513,10 @@ class AsymFlux2KleinLoaderNoCLIP:
             ),
         )
 
-        # Force pipeline and underlying modules (like VAE) into target precision
+        # Force pipeline into target precision
         pipe = pipe.to(dtype=torch_dtype)
 
-        # Bulletproof Pre-Hook: Catches any floating point tensor trying to enter the transformer 
-        # and rigorously forces it to match the transformer's dtype (prevents matrix crash)
+        # Bulletproof Pre-Hook
         def _pre_hook(module, args, kwargs):
             target_dtype = module.dtype
             new_args = tuple(
@@ -532,12 +530,8 @@ class AsymFlux2KleinLoaderNoCLIP:
             return new_args, new_kwargs
             
         pipe.transformer.register_forward_pre_hook(_pre_hook, with_kwargs=True)
-
-        # Skip model_cpu_offload — text_encoder is None so the offload
-        # sequence ("text_encoder->transformer") would be unreliable.
-        # Just move to device directly.
         
-        # --- Clean up meta tensors before device transfer ---
+        # Clean up meta tensors
         for module in pipe.transformer.modules():
             for name, param in module.named_parameters(recurse=False):
                 if param is not None and param.device.type == "meta":
@@ -548,9 +542,17 @@ class AsymFlux2KleinLoaderNoCLIP:
                 if buffer is not None and buffer.device.type == "meta":
                     new_buffer = torch.zeros_like(buffer, device="cpu", dtype=torch_dtype)
                     module.register_buffer(name, new_buffer)
-        # ----------------------------------------------------
 
-        pipe = pipe.to(device)
+        # Safely offload layer-by-layer to allow 18GB bfloat16 to run on 8GB VRAM
+        try:
+            pipe.enable_sequential_cpu_offload()
+        except Exception as e:
+            logger.warning(f"Sequential offload failed, forcing model offload: {e}")
+            try:
+                pipe.enable_model_cpu_offload()
+            except Exception as e2:
+                logger.warning(f"All offloading failed, forcing device transfer: {e2}")
+                pipe = pipe.to(device)
 
         _pipe_cache[cache_key] = pipe
         logger.info("AsymFLUX.2 klein pipeline ready (no text encoder)")
@@ -558,11 +560,7 @@ class AsymFlux2KleinLoaderNoCLIP:
 
 
 class AsymFlux2KleinCondSampler:
-    """Generate pixel-space images with AsymFLUX.2 klein using external CONDITIONING.
-
-    Use this with AsymFLUX.2 Klein Loader (No CLIP) and standard ComfyUI
-    CLIPLoader (GGUF) + CLIPTextEncode nodes for text encoding.
-    """
+    """Generate pixel-space images with AsymFLUX.2 klein using external CONDITIONING."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -628,22 +626,16 @@ class AsymFlux2KleinCondSampler:
     ):
         from PIL import Image
 
-        # Extract prompt_embeds from ComfyUI CONDITIONING format: [(tensor, dict)]
         prompt_embeds = positive[0][0]
 
-        # Extract or synthesize negative prompt_embeds
         if negative is not None:
             negative_prompt_embeds = negative[0][0]
         else:
-            # Zeros embedding = unconditional for CFG. Not perfect (a real
-            # empty-prompt encoding has chat-template tokens) but functional.
             negative_prompt_embeds = torch.zeros_like(prompt_embeds)
 
-        # Ensure correct dtype AND device for the pipeline's transformer.
         target_dtype = pipe.transformer.dtype
         target_device = pipe._execution_device
         
-        # Explicitly move to device AND strictly cast to the transformer's precision
         prompt_embeds = prompt_embeds.to(target_device).to(target_dtype)
         negative_prompt_embeds = negative_prompt_embeds.to(target_device).to(target_dtype)
 
