@@ -292,7 +292,6 @@ class AsymFlux2KleinLoaderNoCLIP:
         pipe = pipe.to(dtype=torch_dtype)
         _cleanup_meta(pipe.transformer, torch_dtype)
         
-        # Ensures safe memory management during inference
         pipe.enable_sequential_cpu_offload()
 
         _pipe_cache[cache_key] = pipe
@@ -401,15 +400,6 @@ class AsymFlux2KleinCondSampler:
             n_embeds = negative[0][0].to(target_device).to(target_dtype)
         else:
             n_embeds = torch.zeros_like(p_embeds)
-
-        # The Projection Fix for Static/Noise
-        if p_embeds.shape[-1] == 4096:
-            if hasattr(pipe.transformer, "caption_projection"):
-                p_embeds = pipe.transformer.caption_projection(p_embeds)
-                n_embeds = pipe.transformer.caption_projection(n_embeds)
-            else:
-                p_embeds = p_embeds[:, :, :1024]
-                n_embeds = n_embeds[:, :, :1024]
 
         input_image = None
         if image is not None:
