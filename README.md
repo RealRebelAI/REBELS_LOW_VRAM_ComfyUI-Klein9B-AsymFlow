@@ -18,35 +18,27 @@ Core inference code extracted from [LakonLab](https://github.com/Lakonik/LakonLa
 
 ## Setup
 
-### 1. Install dependencies
+### 1. install custom nodes.
 
 ```bash
-cd ComfyUI/custom_nodes/ComfyUI-AsymFlow
+git clone https://github.com/RealRebelAI/REBELS_LOW_VRAM_ComfyUI-Klein9B-AsymFlow.git
+cd ComfyUI/custom_nodes/REBELS_LOW_VRAM_ComfyUI-Klein9B-AsymFlow
+..\..\..\python_embeded\python.exe -m pip install -r requirements.txt
+```
+
+### 2. Install dependencies
+
+```bash
+cd ComfyUI/custom_nodes/REBELS_LOW_VRAM_ComfyUI-Klein9B-AsymFlow
+..\..\..\python_embeded\python.exe -m pip install -r requirements.txt
+
+OR
+
+cd ComfyUI/custom_nodes/REBELS_LOW_VRAM_ComfyUI-Klein9B-AsymFlow
 pip install -r requirements.txt
 ```
 
-### 2. Download models
 
-**Transformer** → `models/diffusion_models/`
-```bash
-huggingface-cli download black-forest-labs/FLUX.2-klein-base-9B \
-    flux-2-klein-base-9b.safetensors \
-    --local-dir ComfyUI/models/diffusion_models/
-```
-
-**Text Encoder + Tokenizer** → `models/text_encoders/`
-```bash
-huggingface-cli download black-forest-labs/FLUX.2-klein-base-9B \
-    --include "text_encoder/*" "tokenizer/*" \
-    --local-dir ComfyUI/models/text_encoders/FLUX2-klein-9B/
-```
-
-**Adapter** → `models/loras/`
-```bash
-huggingface-cli download Lakonik/AsymFLUX.2-klein-9B \
-    diffusion_pytorch_model.safetensors \
-    --local-dir ComfyUI/models/loras/
-```
 
 ### 3. Use in ComfyUI
 
