@@ -244,6 +244,38 @@ class AsymFlux2KleinLoader:
             ),
         )
 
+        # Force pipeline and underlying modules (like VAE) into target precision
+        pipe = pipe.to(dtype=torch_dtype)
+
+        # Bulletproof Pre-Hook: Catches any floating point tensor trying to enter the transformer 
+        # and rigorously forces it to match the transformer's dtype (prevents matrix crash)
+        def _pre_hook(module, args, kwargs):
+            target_dtype = module.dtype
+            new_args = tuple(
+                a.to(target_dtype) if isinstance(a, torch.Tensor) and a.is_floating_point() else a 
+                for a in args
+            )
+            new_kwargs = {
+                k: (v.to(target_dtype) if isinstance(v, torch.Tensor) and v.is_floating_point() else v)
+                for k, v in kwargs.items()
+            }
+            return new_args, new_kwargs
+            
+        pipe.transformer.register_forward_pre_hook(_pre_hook, with_kwargs=True)
+
+        # --- Clean up meta tensors before offload/device transfer ---
+        for module in pipe.transformer.modules():
+            for name, param in module.named_parameters(recurse=False):
+                if param is not None and param.device.type == "meta":
+                    new_tensor = torch.zeros_like(param, device="cpu", dtype=torch_dtype)
+                    module.register_parameter(name, torch.nn.Parameter(new_tensor, requires_grad=param.requires_grad))
+                    
+            for name, buffer in module.named_buffers(recurse=False):
+                if buffer is not None and buffer.device.type == "meta":
+                    new_buffer = torch.zeros_like(buffer, device="cpu", dtype=torch_dtype)
+                    module.register_buffer(name, new_buffer)
+        # -------------------------------------------------------------
+
         # 8. Move to device
         if enable_cpu_offload:
             pipe.enable_model_cpu_offload()
@@ -334,6 +366,299 @@ class AsymFlux2KleinSampler:
         result = pipe(
             prompt=prompt,
             negative_prompt=negative_prompt if negative_prompt else None,
+            image=input_image,
+            width=width,
+            height=height,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            orthogonal_guidance=orthogonal_guidance,
+            clamp_denoised=clamp_denoised,
+            generator=generator,
+        )
+
+        pil_image = result.images[0]
+        img_array = np.array(pil_image).astype(np.float32) / 255.0
+        img_tensor = torch.from_numpy(img_array).unsqueeze(0)
+
+        return (img_tensor,)
+
+
+class AsymFlux2KleinLoaderNoCLIP:
+    """Load the AsymFLUX.2 klein pixel pipeline WITHOUT a text encoder.
+
+    Use this when you want to provide your own CONDITIONING from an external
+    CLIP/GGUF loader (e.g. ComfyUI-GGUF CLIPLoader + CLIPTextEncode).
+
+    - Transformer .safetensors from models/diffusion_models/
+    - Adapter .safetensors from models/loras/
+    - NO text encoder — conditioning comes from external nodes
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        diff_models = folder_paths.get_filename_list("diffusion_models")
+        loras = folder_paths.get_filename_list("loras")
+        return {
+            "required": {
+                "transformer": (diff_models, {}),
+                "adapter": (loras, {}),
+            },
+            "optional": {
+                "dtype": (
+                    ["bfloat16", "float16", "float32"],
+                    {"default": "bfloat16"},
+                ),
+                "device": (["cuda", "mps", "cpu"], {"default": "cuda"}),
+            },
+        }
+
+    RETURN_TYPES = ("ASYMFLUX_PIPE",)
+    RETURN_NAMES = ("pipe",)
+    FUNCTION = "load"
+    CATEGORY = "AsymFlow"
+    DESCRIPTION = (
+        "Load the AsymFLUX.2 klein 9B pixel-space pipeline WITHOUT a text encoder.\n"
+        "Use with AsymFLUX.2 Klein Cond Sampler to provide your own CONDITIONING\n"
+        "from an external GGUF/CLIP loader.\n\n"
+        "Transformer: models/diffusion_models/ (.safetensors)\n"
+        "Adapter: models/loras/ (.safetensors)"
+    )
+
+    def load(self, transformer, adapter, dtype="bfloat16", device="cuda"):
+        transformer_path = folder_paths.get_full_path("diffusion_models", transformer)
+        adapter_path = folder_paths.get_full_path("loras", adapter)
+
+        cache_key = ("no_clip", transformer_path, adapter_path, dtype, device)
+        if cache_key in _pipe_cache:
+            logger.info("Using cached AsymFLUX.2 klein pipeline (no CLIP)")
+            return (_pipe_cache[cache_key],)
+
+        torch_dtype = _get_dtype(dtype)
+
+        from accelerate import init_empty_weights
+        from safetensors.torch import load_file
+        from .asymflow_lib import (
+            PixelFlux2KleinPipeline,
+            OklabColorEncoder,
+            FlowAdapterScheduler,
+        )
+        from .asymflow_lib.asymflux2_model import AsymFlux2Transformer2DModel
+
+        # 1. Load base transformer weights
+        logger.info(f"Loading transformer weights: {transformer_path}")
+        base_state_dict = load_file(transformer_path, device="cpu")
+
+        if any(k.startswith("transformer.") for k in list(base_state_dict.keys())[:5]):
+            base_state_dict = {
+                k.removeprefix("transformer."): v
+                for k, v in base_state_dict.items()
+                if k.startswith("transformer.")
+            }
+
+        # 2. Load adapter weights and split into overwrites + LoRA
+        logger.info(f"Loading adapter weights: {adapter_path}")
+        adapter_state_dict = load_file(adapter_path, device="cpu")
+
+        overwrite_state_dict = {}
+        lora_state_dict = {}
+        for k, v in adapter_state_dict.items():
+            k_clean = k.removeprefix("transformer.")
+            if "lora" in k_clean:
+                lora_state_dict[k_clean] = v.to(dtype=torch_dtype)
+            else:
+                overwrite_state_dict[k_clean] = v.to(dtype=torch_dtype)
+        del adapter_state_dict
+
+        # 3. Merge: base weights + adapter overwrites
+        for k in base_state_dict:
+            base_state_dict[k] = base_state_dict[k].to(dtype=torch_dtype)
+        base_state_dict.update(overwrite_state_dict)
+        del overwrite_state_dict
+
+        # 4. Create AsymFlux2 model and load merged weights
+        logger.info("Creating AsymFlux2 transformer model")
+        with init_empty_weights():
+            transformer_model = AsymFlux2Transformer2DModel(**_ASYMFLUX2_KLEIN_CONFIG)
+
+        transformer_model.load_state_dict(base_state_dict, strict=False, assign=True)
+        del base_state_dict
+
+        # 5. Load LoRA weights
+        if lora_state_dict:
+            logger.info("Loading LoRA adapter weights")
+            transformer_model.load_lora_adapter(
+                lora_state_dict, prefix=None, adapter_name="asymflow", low_cpu_mem_usage=True
+            )
+        del lora_state_dict
+
+        # 6. Construct pipeline WITHOUT text encoder
+        logger.info("Constructing AsymFLUX.2 klein pipeline (no text encoder)")
+        pipe = PixelFlux2KleinPipeline(
+            transformer=transformer_model,
+            text_encoder=None,
+            tokenizer=None,
+            vae=OklabColorEncoder(
+                use_affine_norm=True,
+                mean=(0.56, 0.0, 0.01),
+                std=0.16,
+            ),
+            scheduler=FlowAdapterScheduler(
+                shift=17.0,
+                use_dynamic_shifting=True,
+                base_seq_len=1024**2,
+                max_seq_len=2048**2,
+                base_logshift=math.log(17.0),
+                max_logshift=math.log(34.0),
+                dynamic_shifting_type="sqrt",
+                base_scheduler="UniPCMultistep",
+            ),
+        )
+
+        # Force pipeline and underlying modules (like VAE) into target precision
+        pipe = pipe.to(dtype=torch_dtype)
+
+        # Bulletproof Pre-Hook: Catches any floating point tensor trying to enter the transformer 
+        # and rigorously forces it to match the transformer's dtype (prevents matrix crash)
+        def _pre_hook(module, args, kwargs):
+            target_dtype = module.dtype
+            new_args = tuple(
+                a.to(target_dtype) if isinstance(a, torch.Tensor) and a.is_floating_point() else a 
+                for a in args
+            )
+            new_kwargs = {
+                k: (v.to(target_dtype) if isinstance(v, torch.Tensor) and v.is_floating_point() else v)
+                for k, v in kwargs.items()
+            }
+            return new_args, new_kwargs
+            
+        pipe.transformer.register_forward_pre_hook(_pre_hook, with_kwargs=True)
+
+        # Skip model_cpu_offload — text_encoder is None so the offload
+        # sequence ("text_encoder->transformer") would be unreliable.
+        # Just move to device directly.
+        
+        # --- Clean up meta tensors before device transfer ---
+        for module in pipe.transformer.modules():
+            for name, param in module.named_parameters(recurse=False):
+                if param is not None and param.device.type == "meta":
+                    new_tensor = torch.zeros_like(param, device="cpu", dtype=torch_dtype)
+                    module.register_parameter(name, torch.nn.Parameter(new_tensor, requires_grad=param.requires_grad))
+                    
+            for name, buffer in module.named_buffers(recurse=False):
+                if buffer is not None and buffer.device.type == "meta":
+                    new_buffer = torch.zeros_like(buffer, device="cpu", dtype=torch_dtype)
+                    module.register_buffer(name, new_buffer)
+        # ----------------------------------------------------
+
+        pipe = pipe.to(device)
+
+        _pipe_cache[cache_key] = pipe
+        logger.info("AsymFLUX.2 klein pipeline ready (no text encoder)")
+        return (pipe,)
+
+
+class AsymFlux2KleinCondSampler:
+    """Generate pixel-space images with AsymFLUX.2 klein using external CONDITIONING.
+
+    Use this with AsymFLUX.2 Klein Loader (No CLIP) and standard ComfyUI
+    CLIPLoader (GGUF) + CLIPTextEncode nodes for text encoding.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pipe": ("ASYMFLUX_PIPE",),
+                "positive": ("CONDITIONING",),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 2**32 - 2}),
+            },
+            "optional": {
+                "negative": ("CONDITIONING",),
+                "width": (
+                    "INT",
+                    {"default": 1024, "min": 256, "max": 2048, "step": 16},
+                ),
+                "height": (
+                    "INT",
+                    {"default": 1024, "min": 256, "max": 2048, "step": 16},
+                ),
+                "num_inference_steps": (
+                    "INT",
+                    {"default": 38, "min": 1, "max": 150},
+                ),
+                "guidance_scale": (
+                    "FLOAT",
+                    {"default": 4.0, "min": 0.0, "max": 20.0, "step": 0.1},
+                ),
+                "orthogonal_guidance": (
+                    "FLOAT",
+                    {"default": 1.0, "min": 0.0, "max": 5.0, "step": 0.1},
+                ),
+                "clamp_denoised": (
+                    "BOOLEAN",
+                    {"default": True, "label_on": "True", "label_off": "False"},
+                ),
+                "image": ("IMAGE",),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "generate"
+    CATEGORY = "AsymFlow"
+    DESCRIPTION = (
+        "Generate pixel-space images using AsymFLUX.2 klein with external CONDITIONING.\n"
+        "Connect positive/negative from CLIPTextEncode (with a GGUF Qwen3-8B encoder).\n"
+        "If negative is not connected, an empty (zeros) embedding is used for CFG."
+    )
+
+    def generate(
+        self,
+        pipe,
+        positive,
+        seed,
+        negative=None,
+        width=1024,
+        height=1024,
+        num_inference_steps=38,
+        guidance_scale=4.0,
+        orthogonal_guidance=1.0,
+        clamp_denoised=True,
+        image=None,
+    ):
+        from PIL import Image
+
+        # Extract prompt_embeds from ComfyUI CONDITIONING format: [(tensor, dict)]
+        prompt_embeds = positive[0][0]
+
+        # Extract or synthesize negative prompt_embeds
+        if negative is not None:
+            negative_prompt_embeds = negative[0][0]
+        else:
+            # Zeros embedding = unconditional for CFG. Not perfect (a real
+            # empty-prompt encoding has chat-template tokens) but functional.
+            negative_prompt_embeds = torch.zeros_like(prompt_embeds)
+
+        # Ensure correct dtype AND device for the pipeline's transformer.
+        target_dtype = pipe.transformer.dtype
+        target_device = pipe._execution_device
+        
+        # Explicitly move to device AND strictly cast to the transformer's precision
+        prompt_embeds = prompt_embeds.to(target_device).to(target_dtype)
+        negative_prompt_embeds = negative_prompt_embeds.to(target_device).to(target_dtype)
+
+        input_image = None
+        if image is not None:
+            img_np = (image[0].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+            input_image = Image.fromarray(img_np)
+
+        generator = torch.Generator(device="cpu").manual_seed(seed)
+
+        result = pipe(
+            prompt=None,
+            prompt_embeds=prompt_embeds,
+            negative_prompt=None,
+            negative_prompt_embeds=negative_prompt_embeds,
             image=input_image,
             width=width,
             height=height,
