@@ -39,9 +39,35 @@ cd ComfyUI/custom_nodes/REBELS_LOW_VRAM_ComfyUI-Klein9B-AsymFlow
 pip install -r requirements.txt
 ```
 
+### 3. Download Model files
+
+- bf16 model - /models/diffusion_models/
+
+https://huggingface.co/black-forest-labs/FLUX.2-klein-9B/blob/main/flux-2-klein-9b.safetensors
 
 
-### 3. Use in ComfyUI
+
+- gguf model - /models/unet/
+https://huggingface.co/unsloth/FLUX.2-klein-9B-GGUF/tree/main
+
+
+- fp4 encoder (smallest) - /models/text_encoders/
+
+https://huggingface.co/Comfy-Org/vae-text-encorder-for-flux-klein-9b/blob/main/split_files/text_encoders/qwen_3_8b_fp4mixed.safetensors
+
+
+- fp8 encoder (better but larger) - /models/text_encoders/
+
+https://huggingface.co/Comfy-Org/vae-text-encorder-for-flux-klein-9b/blob/main/split_files/text_encoders/qwen_3_8b_fp8mixed.safetensors
+
+
+
+REQUIRED Adapter LoRA (rename to "ASYM_FLUX_KLEIN_9B") - /models/loras/
+
+https://huggingface.co/Lakonik/AsymFLUX.2-klein-9B/blob/main/diffusion_pytorch_model.safetensors
+
+
+### 4. Use in ComfyUI
 
 workflow:
 https://civitai.com/models/2626000/rebels-asym-flux-2-klein-9b?modelVersionId=2948288
