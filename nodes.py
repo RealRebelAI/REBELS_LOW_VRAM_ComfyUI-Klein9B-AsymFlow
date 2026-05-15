@@ -104,8 +104,7 @@ class AsymFlux2KleinLoader:
 
     def load(self, transformer, text_encoder, adapter, dtype="bfloat16", device="cuda", enable_cpu_offload=True):
         transformer_path = folder_paths.get_full_path("diffusion_models", transformer)
-        adapter_path = folder_paths.get_full_path("loras", adapter)
-        
+        adapter_path = folder_paths.get_full_path("loras", adapter) 
         try:
             te_dir = _resolve_model_dir("text_encoders", text_encoder)
         except FileNotFoundError:
@@ -212,10 +211,16 @@ class AsymFlux2KleinSampler:
         generator = torch.Generator(device="cpu").manual_seed(seed)
 
         result = pipe(
-            prompt=prompt, negative_prompt=negative_prompt, image=input_image,
-            width=width, height=height, num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale, orthogonal_guidance=orthogonal_guidance,
-            clamp_denoised=clamp_denoised, generator=generator
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            image=input_image,
+            width=width,
+            height=height,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            orthogonal_guidance=orthogonal_guidance,
+            clamp_denoised=clamp_denoised,
+            generator=generator
         )
 
         img_tensor = torch.from_numpy(np.array(result.images[0]).astype(np.float32) / 255.0).unsqueeze(0)
@@ -290,8 +295,7 @@ class AsymFlux2KleinLoaderNoCLIP:
         )
 
         pipe = pipe.to(dtype=torch_dtype)
-        _cleanup_meta(pipe.transformer, torch_dtype)
-        
+        _cleanup_meta(pipe.transformer, torch_dtype) 
         pipe.enable_sequential_cpu_offload()
 
         _pipe_cache[cache_key] = pipe
@@ -357,8 +361,7 @@ class AsymFlux2KleinLoaderGGUF:
         )
 
         pipe = pipe.to(dtype=torch_dtype)
-        _cleanup_meta(pipe.transformer, torch_dtype)
-        
+        _cleanup_meta(pipe.transformer, torch_dtype) 
         pipe.enable_sequential_cpu_offload()
 
         return (pipe,)
@@ -395,11 +398,16 @@ class AsymFlux2KleinCondSampler:
         target_dtype = pipe.transformer.dtype
         target_device = pipe._execution_device
 
+        # EXTRACT BOTH SEQUENCE AND POOLED EMBEDDINGS
         p_embeds = positive[0][0].to(target_device).to(target_dtype)
+        p_pooled = positive[0][1]["pooled_output"].to(target_device).to(target_dtype)
+
         if negative is not None:
             n_embeds = negative[0][0].to(target_device).to(target_dtype)
+            n_pooled = negative[0][1]["pooled_output"].to(target_device).to(target_dtype)
         else:
             n_embeds = torch.zeros_like(p_embeds)
+            n_pooled = torch.zeros_like(p_pooled)
 
         input_image = None
         if image is not None:
@@ -409,11 +417,19 @@ class AsymFlux2KleinCondSampler:
         generator = torch.Generator(device="cpu").manual_seed(seed)
 
         result = pipe(
-            prompt=None, prompt_embeds=p_embeds,
-            negative_prompt=None, negative_prompt_embeds=n_embeds,
-            image=input_image, width=width, height=height,
-            num_inference_steps=num_inference_steps, guidance_scale=guidance_scale,
-            orthogonal_guidance=orthogonal_guidance, clamp_denoised=clamp_denoised,
+            prompt=None,
+            prompt_embeds=p_embeds,
+            pooled_prompt_embeds=p_pooled,
+            negative_prompt=None,
+            negative_prompt_embeds=n_embeds,
+            negative_pooled_prompt_embeds=n_pooled,
+            image=input_image,
+            width=width,
+            height=height,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            orthogonal_guidance=orthogonal_guidance,
+            clamp_denoised=clamp_denoised,
             generator=generator
         )
 
