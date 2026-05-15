@@ -22,6 +22,7 @@ Core inference code extracted from [LakonLab](https://github.com/Lakonik/LakonLa
 
 ```bash
 git clone https://github.com/RealRebelAI/REBELS_LOW_VRAM_ComfyUI-Klein9B-AsymFlow.git
+
 cd ComfyUI/custom_nodes/REBELS_LOW_VRAM_ComfyUI-Klein9B-AsymFlow
 ..\..\..\python_embeded\python.exe -m pip install -r requirements.txt
 ```
@@ -42,9 +43,8 @@ pip install -r requirements.txt
 
 ### 3. Use in ComfyUI
 
-1. Add **AsymFLUX.2 Klein Loader** — select transformer, text encoder dir, and adapter
-2. Connect to **AsymFLUX.2 Klein Sampler**
-3. Enter a prompt and generate
+workflow:
+https://civitai.com/models/2626000/rebels-asym-flux-2-klein-9b?modelVersionId=2948288
 
 ## Model Locations
 
