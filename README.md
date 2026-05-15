@@ -70,6 +70,7 @@ The text encoder directory supports both flat layout and BFL-style subdirectorie
 
 - **AsymFlow**: Hansheng Chen, Jan Ackermann, Minseo Kim, Gordon Wetzstein, Leonidas Guibas (Stanford University)
 - **FLUX.2 Klein**: Black Forest Labs
+- **Rebel AI**: Custom Node Fork Contributor For GGUF and CLIP
 
 ## License
 
