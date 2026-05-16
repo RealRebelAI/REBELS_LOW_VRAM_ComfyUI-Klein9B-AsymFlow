@@ -16,9 +16,8 @@ logger = logging.getLogger("[AsymFlow]")
 _pipe_cache = {}
 
 _ASYMFLUX2_KLEIN_CONFIG = {
-    "patch_size": 1,
-    "in_channels": 128,
-    "hidden_size": 4096,
+    "patch_size": 16,
+    "in_channels": 3,
     "base_rank": 128,
     "num_layers": 8,
     "num_single_layers": 24,
@@ -32,10 +31,11 @@ _ASYMFLUX2_KLEIN_CONFIG = {
     "eps": 1e-6,
     "sigma_min": 1e-4,
     "num_timesteps": 1,
-    "guidance_embeds": False,
+    "guidance_embeds": True,
 }
 
 def _get_dtype(name: str):
+    # Strictly avoiding fp8_e4m3fn due to missing mul_cuda implementations in PyTorch
     return {
         "bfloat16": torch.bfloat16,
         "float16": torch.float16,
@@ -69,8 +69,8 @@ def _resolve_model_dir(folder_name, dir_name):
 
 def _cleanup_meta(model, dtype):
     """
-    Cleans up stranded meta tensors AFTER base weights are assigned,
-    but BEFORE LoRA is loaded.
+    Cleans up any stranded meta tensors after weight assignment to prevent
+    NotImplementedError during CPU offloading.
     """
     for module in model.modules():
         for name, param in module.named_parameters(recurse=False):
@@ -82,100 +82,38 @@ def _cleanup_meta(model, dtype):
                 new_buffer = torch.zeros_like(buffer, device="cpu", dtype=dtype)
                 module.register_buffer(name, new_buffer)
 
-def _convert_comfy_to_diffusers_format(comfy_sd, dtype):
+def _merge_lora_into_base(base_state_dict, lora_state_dict, torch_dtype):
+    """Merge LoRA weights directly into base state_dict.
+
+    Avoids load_lora_adapter which creates meta-device LoRA modules
+    that get zeroed by _cleanup_meta. Instead, computes W' = W + B @ A
+    and bakes the result into the base weights before model creation.
     """
-    Translates ComfyUI keys to Diffusers format. Uses .clone() on chunks 
-    to prevent memory fragmentation without the massive overhead of contiguous().
-    """
-    logger.info("[AsymFlow] Translating ComfyUI keys to Diffusers format...")
-    diffusers_sd = {}
+    # Pair up lora_A and lora_B by their base parameter path
+    lora_pairs = {}
+    for k, v in lora_state_dict.items():
+        if ".lora_A." in k:
+            base_path = k.split(".lora_A.")[0]
+            lora_pairs.setdefault(base_path, {})["A"] = v
+        elif ".lora_B." in k:
+            base_path = k.split(".lora_B.")[0]
+            lora_pairs.setdefault(base_path, {})["B"] = v
 
-    for k, v in comfy_sd.items():
-        k_src = k.removeprefix("transformer.") if k.startswith("transformer.") else k
+    merged_count = 0
+    for base_path, pair in lora_pairs.items():
+        if "A" in pair and "B" in pair:
+            base_key = base_path + ".weight"
+            if base_key in base_state_dict:
+                A = pair["A"].to(dtype=torch_dtype)
+                B = pair["B"].to(dtype=torch_dtype)
+                # W' = W + B @ A  (default PEFT alpha=rank → scale=1.0)
+                base_state_dict[base_key] = base_state_dict[base_key] + (B @ A)
+                merged_count += 1
+            else:
+                logger.warning(f"[LORA] Base key not found for merge: {base_key}")
 
-        if k_src.startswith("time_in."):
-            diffusers_sd[k_src.replace("time_in.in_layer", "time_text_embed.timestep_embedder.linear_1")] = v
-            continue
-        if k_src.startswith("vector_in."):
-            diffusers_sd[k_src.replace("vector_in.in_layer", "time_text_embed.text_embedder.linear_1")] = v
-            continue
-        if k_src.startswith("guidance_in."):
-            diffusers_sd[k_src.replace("guidance_in.in_layer", "time_guidance_embed.timestep_embedder.linear_1")] = v
-            continue
-
-        if "double_blocks." in k_src:
-            block_idx = k_src.split(".")[1]
-            suffix = k_src.split(f"double_blocks.{block_idx}.")[1]
-            diff_prefix = f"transformer_blocks.{block_idx}."
-
-            if suffix.startswith("img_attn.qkv."):
-                chunks = torch.chunk(v, 3, dim=0)
-                diffusers_sd[f"{diff_prefix}attn.to_q.weight" if "weight" in suffix else f"{diff_prefix}attn.to_q.bias"] = chunks[0].clone()
-                diffusers_sd[f"{diff_prefix}attn.to_k.weight" if "weight" in suffix else f"{diff_prefix}attn.to_k.bias"] = chunks[1].clone()
-                diffusers_sd[f"{diff_prefix}attn.to_v.weight" if "weight" in suffix else f"{diff_prefix}attn.to_v.bias"] = chunks[2].clone()
-                continue
-            if suffix.startswith("txt_attn.qkv."):
-                chunks = torch.chunk(v, 3, dim=0)
-                diffusers_sd[f"{diff_prefix}attn_context.to_q.weight" if "weight" in suffix else f"{diff_prefix}attn_context.to_q.bias"] = chunks[0].clone()
-                diffusers_sd[f"{diff_prefix}attn_context.to_k.weight" if "weight" in suffix else f"{diff_prefix}attn_context.to_k.bias"] = chunks[1].clone()
-                diffusers_sd[f"{diff_prefix}attn_context.to_v.weight" if "weight" in suffix else f"{diff_prefix}attn_context.to_v.bias"] = chunks[2].clone()
-                continue
-            if suffix.startswith("img_attn.proj."):
-                diffusers_sd[f"{diff_prefix}attn.to_out.0.weight" if "weight" in suffix else f"{diff_prefix}attn.to_out.0.bias"] = v
-                continue
-            if suffix.startswith("txt_attn.proj."):
-                diffusers_sd[f"{diff_prefix}attn_context.to_out.weight" if "weight" in suffix else f"{diff_prefix}attn_context.to_out.bias"] = v
-                continue
-            if suffix.startswith("img_mlp."):
-                new_s = suffix.replace("img_mlp.0", "ff.linear_in").replace("img_mlp.2", "ff.linear_out")
-                diffusers_sd[f"{diff_prefix}{new_s}"] = v
-                continue
-            if suffix.startswith("txt_mlp."):
-                new_s = suffix.replace("txt_mlp.0", "ff_context.linear_in").replace("txt_mlp.2", "ff_context.linear_out")
-                diffusers_sd[f"{diff_prefix}{new_s}"] = v
-                continue
-            if suffix.startswith("img_mod.lin."):
-                diffusers_sd[f"{diff_prefix}norm1.linear.weight" if "weight" in suffix else f"{diff_prefix}norm1.linear.bias"] = v
-                continue
-            if suffix.startswith("txt_mod.lin."):
-                diffusers_sd[f"{diff_prefix}norm1_context.linear.weight" if "weight" in suffix else f"{diff_prefix}norm1_context.linear.bias"] = v
-                continue
-
-        if "single_blocks." in k_src:
-            block_idx = k_src.split(".")[1]
-            suffix = k_src.split(f"single_blocks.{block_idx}.")[1]
-            diff_prefix = f"single_transformer_blocks.{block_idx}."
-
-            if suffix.startswith("linear1."):
-                chunks = torch.chunk(v, 4, dim=0)
-                diffusers_sd[f"{diff_prefix}attn.to_q.weight" if "weight" in suffix else f"{diff_prefix}attn.to_q.bias"] = chunks[0].clone()
-                diffusers_sd[f"{diff_prefix}attn.to_k.weight" if "weight" in suffix else f"{diff_prefix}attn.to_k.bias"] = chunks[1].clone()
-                diffusers_sd[f"{diff_prefix}attn.to_v.weight" if "weight" in suffix else f"{diff_prefix}attn.to_v.bias"] = chunks[2].clone()
-                diffusers_sd[f"{diff_prefix}ff.linear_in.weight" if "weight" in suffix else f"{diff_prefix}ff.linear_in.bias"] = chunks[3].clone()
-                continue
-            if suffix.startswith("linear2."):
-                diffusers_sd[f"{diff_prefix}attn.to_out.weight" if "weight" in suffix else f"{diff_prefix}attn.to_out.bias"] = v
-                continue
-            if suffix.startswith("modulation.lin."):
-                diffusers_sd[f"{diff_prefix}norm1.linear.weight" if "weight" in suffix else f"{diff_prefix}norm1.linear.bias"] = v
-                continue
-
-        if k_src.startswith("img_in."):
-            diffusers_sd[k_src.replace("img_in", "x_embedder")] = v
-            continue
-        if k_src.startswith("txt_in."):
-            diffusers_sd[k_src.replace("txt_in", "context_embedder")] = v
-            continue
-        if k_src.startswith("final_layer.linear."):
-            diffusers_sd[k_src.replace("final_layer.linear", "proj_out")] = v
-            continue
-        if k_src.startswith("final_layer.adaLN_modulation.lin."):
-            diffusers_sd[k_src.replace("final_layer.adaLN_modulation.lin", "norm_out.linear")] = v
-            continue
-
-        diffusers_sd[k_src] = v
-
-    return diffusers_sd
+    logger.info(f"Merged {merged_count} LoRA pairs into base weights")
+    return base_state_dict
 
 class AsymFlux2KleinLoader:
     @classmethod
@@ -220,23 +158,39 @@ class AsymFlux2KleinLoader:
         from .asymflow_lib import PixelFlux2KleinPipeline, OklabColorEncoder, FlowAdapterScheduler
         from .asymflow_lib.asymflux2_model import AsymFlux2Transformer2DModel
 
-        raw_state_dict = load_file(transformer_path, device="cpu")
-        base_state_dict = _convert_comfy_to_diffusers_format(raw_state_dict, torch_dtype)
+        base_state_dict = load_file(transformer_path, device="cpu")
+        if any(k.startswith("transformer.") for k in list(base_state_dict.keys())[:5]):
+            base_state_dict = {k.removeprefix("transformer."): v for k, v in base_state_dict.items() if k.startswith("transformer.")}
+
+        adapter_state_dict = load_file(adapter_path, device="cpu")
+
+        overwrite_state_dict = {}
+        lora_state_dict = {}
+        for k, v in adapter_state_dict.items():
+            # STRIP PEFT TRACKING TAGS
+            k_clean = k.replace("base_model.model.", "").replace(".modules_to_save.default", "").removeprefix("transformer.")
+            if "lora" in k_clean:
+                lora_state_dict[k_clean] = v.to(dtype=torch_dtype)
+            else:
+                overwrite_state_dict[k_clean] = v.to(dtype=torch_dtype)
+
+        for k in base_state_dict:
+            base_state_dict[k] = base_state_dict[k].to(dtype=torch_dtype)
+        base_state_dict.update(overwrite_state_dict)
+
+        # Merge LoRA directly into base weights
+        if lora_state_dict:
+            base_state_dict = _merge_lora_into_base(base_state_dict, lora_state_dict, torch_dtype)
+        del lora_state_dict
 
         with init_empty_weights():
             transformer_model = AsymFlux2Transformer2DModel(**_ASYMFLUX2_KLEIN_CONFIG)
 
         transformer_model.load_state_dict(base_state_dict, strict=False, assign=True)
-
-        # 1. Clean Meta First
-        _cleanup_meta(transformer_model, torch_dtype)
-
-        # 2. Load LoRA Second
-        adapter_state_dict = load_file(adapter_path, device="cpu")
-        lora_state_dict = {k.removeprefix("transformer."): v.to(dtype=torch_dtype) for k, v in adapter_state_dict.items() if "lora" in k}
+        del base_state_dict
         
-        if lora_state_dict:
-            transformer_model.load_lora_adapter(lora_state_dict, prefix=None, adapter_name="asymflow", low_cpu_mem_usage=True)
+        # MUST cleanup meta tensors created by init_empty_weights before cpu offloading
+        _cleanup_meta(transformer_model, torch_dtype)
 
         te_subdir = os.path.join(te_dir, "text_encoder")
         tok_subdir = os.path.join(te_dir, "tokenizer")
@@ -251,11 +205,11 @@ class AsymFlux2KleinLoader:
             text_encoder=text_encoder_model,
             tokenizer=tokenizer,
             vae=OklabColorEncoder(use_affine_norm=True, mean=(0.56, 0.0, 0.01), std=0.16),
-            scheduler=FlowAdapterScheduler(shift=17.0, use_dynamic_shifting=True, base_seq_len=1024**2, base_scheduler="UniPCMultistep")
+            scheduler=FlowAdapterScheduler(shift=17.0, use_dynamic_shifting=True, base_seq_len=1024**2, max_seq_len=2048**2, base_logshift=math.log(17.0), max_logshift=math.log(34.0), dynamic_shifting_type="sqrt", base_scheduler="UniPCMultistep")
         )
 
         pipe = pipe.to(dtype=torch_dtype)
-        
+
         if enable_cpu_offload:
             pipe.enable_sequential_cpu_offload()
         else:
@@ -348,33 +302,48 @@ class AsymFlux2KleinLoaderNoCLIP:
         from .asymflow_lib import PixelFlux2KleinPipeline, OklabColorEncoder, FlowAdapterScheduler
         from .asymflow_lib.asymflux2_model import AsymFlux2Transformer2DModel
 
-        raw_state_dict = load_file(transformer_path, device="cpu")
-        base_state_dict = _convert_comfy_to_diffusers_format(raw_state_dict, torch_dtype)
+        base_state_dict = load_file(transformer_path, device="cpu")
+        if any(k.startswith("transformer.") for k in list(base_state_dict.keys())[:5]):
+            base_state_dict = {k.removeprefix("transformer."): v for k, v in base_state_dict.items() if k.startswith("transformer.")}
+
+        adapter_state_dict = load_file(adapter_path, device="cpu")
+
+        overwrite_state_dict = {}
+        lora_state_dict = {}
+        for k, v in adapter_state_dict.items():
+            # STRIP PEFT TRACKING TAGS
+            k_clean = k.replace("base_model.model.", "").replace(".modules_to_save.default", "").removeprefix("transformer.")
+            if "lora" in k_clean:
+                lora_state_dict[k_clean] = v.to(dtype=torch_dtype)
+            else:
+                overwrite_state_dict[k_clean] = v.to(dtype=torch_dtype)
+
+        for k in base_state_dict:
+            base_state_dict[k] = base_state_dict[k].to(dtype=torch_dtype)
+        base_state_dict.update(overwrite_state_dict)
+
+        # Merge LoRA directly into base weights
+        if lora_state_dict:
+            base_state_dict = _merge_lora_into_base(base_state_dict, lora_state_dict, torch_dtype)
+        del lora_state_dict
 
         with init_empty_weights():
             transformer_model = AsymFlux2Transformer2DModel(**_ASYMFLUX2_KLEIN_CONFIG)
 
         transformer_model.load_state_dict(base_state_dict, strict=False, assign=True)
-
-        # 1. Clean Meta First
+        del base_state_dict
+        
+        # MUST cleanup meta tensors created by init_empty_weights before cpu offloading
         _cleanup_meta(transformer_model, torch_dtype)
-
-        # 2. Load LoRA Second
-        adapter_state_dict = load_file(adapter_path, device="cpu")
-        lora_state_dict = {k.removeprefix("transformer."): v.to(dtype=torch_dtype) for k, v in adapter_state_dict.items() if "lora" in k}
-
-        if lora_state_dict:
-            transformer_model.load_lora_adapter(lora_state_dict, prefix=None, adapter_name="asymflow", low_cpu_mem_usage=True)
 
         pipe = PixelFlux2KleinPipeline(
             transformer=transformer_model,
             text_encoder=None,
             tokenizer=None,
             vae=OklabColorEncoder(use_affine_norm=True, mean=(0.56, 0.0, 0.01), std=0.16),
-            scheduler=FlowAdapterScheduler(shift=17.0, use_dynamic_shifting=True, base_seq_len=1024**2, base_scheduler="UniPCMultistep")
+            scheduler=FlowAdapterScheduler(shift=17.0, use_dynamic_shifting=True, base_seq_len=1024**2, max_seq_len=2048**2, base_logshift=math.log(17.0), max_logshift=math.log(34.0), dynamic_shifting_type="sqrt", base_scheduler="UniPCMultistep")
         )
 
-        pipe = pipe.to(dtype=torch_dtype)
         pipe.enable_sequential_cpu_offload()
 
         _pipe_cache[cache_key] = pipe
@@ -408,34 +377,44 @@ class AsymFlux2KleinLoaderGGUF:
         from .asymflow_lib.asymflux2_model import AsymFlux2Transformer2DModel
 
         source_model = model.model.diffusion_model
-        raw_state_dict = {k: v.to(torch_dtype) for k, v in source_model.state_dict().items()}
+        base_state_dict = {k: v.to(torch_dtype) for k, v in source_model.state_dict().items()}
 
-        base_state_dict = _convert_comfy_to_diffusers_format(raw_state_dict, torch_dtype)
+        adapter_state_dict = load_file(adapter_path, device="cpu")
+
+        overwrite_state_dict = {}
+        lora_state_dict = {}
+        for k, v in adapter_state_dict.items():
+            # STRIP PEFT TRACKING TAGS
+            k_clean = k.replace("base_model.model.", "").replace(".modules_to_save.default", "").removeprefix("transformer.")
+            if "lora" in k_clean:
+                lora_state_dict[k_clean] = v.to(dtype=torch_dtype)
+            else:
+                overwrite_state_dict[k_clean] = v.to(dtype=torch_dtype)
+
+        base_state_dict.update(overwrite_state_dict)
+
+        # Merge LoRA directly into base weights
+        if lora_state_dict:
+            base_state_dict = _merge_lora_into_base(base_state_dict, lora_state_dict, torch_dtype)
+        del lora_state_dict
 
         with init_empty_weights():
             transformer_model = AsymFlux2Transformer2DModel(**_ASYMFLUX2_KLEIN_CONFIG)
 
         transformer_model.load_state_dict(base_state_dict, strict=False, assign=True)
-
-        # 1. Clean Meta First
+        del base_state_dict
+        
+        # MUST cleanup meta tensors created by init_empty_weights before cpu offloading
         _cleanup_meta(transformer_model, torch_dtype)
-
-        # 2. Load LoRA Second
-        adapter_state_dict = load_file(adapter_path, device="cpu")
-        lora_state_dict = {k.removeprefix("transformer."): v.to(dtype=torch_dtype) for k, v in adapter_state_dict.items() if "lora" in k}
-
-        if lora_state_dict:
-            transformer_model.load_lora_adapter(lora_state_dict, prefix=None, adapter_name="asymflow", low_cpu_mem_usage=True)
 
         pipe = PixelFlux2KleinPipeline(
             transformer=transformer_model,
             text_encoder=None,
             tokenizer=None,
             vae=OklabColorEncoder(use_affine_norm=True, mean=(0.56, 0.0, 0.01), std=0.16),
-            scheduler=FlowAdapterScheduler(shift=17.0, use_dynamic_shifting=True, base_seq_len=1024**2, base_scheduler="UniPCMultistep")
+            scheduler=FlowAdapterScheduler(shift=17.0, use_dynamic_shifting=True, base_seq_len=1024**2, max_seq_len=2048**2, base_logshift=math.log(17.0), max_logshift=math.log(34.0), dynamic_shifting_type="sqrt", base_scheduler="UniPCMultistep")
         )
 
-        pipe = pipe.to(dtype=torch_dtype)
         pipe.enable_sequential_cpu_offload()
 
         return (pipe,)
@@ -473,13 +452,21 @@ class AsymFlux2KleinCondSampler:
         target_device = pipe._execution_device
 
         p_embeds = positive[0][0].to(target_device).to(target_dtype)
-        p_embeds = torch.nan_to_num(p_embeds, nan=0.0, posinf=10.0, neginf=-10.0)
 
         if negative is not None:
             n_embeds = negative[0][0].to(target_device).to(target_dtype)
-            n_embeds = torch.nan_to_num(n_embeds, nan=0.0, posinf=10.0, neginf=-10.0)
         else:
             n_embeds = torch.zeros_like(p_embeds)
+
+        # === DEBUG: Print conditioning info ===
+        logger.warning(f"[DEBUG] p_embeds shape: {p_embeds.shape}, dtype: {p_embeds.dtype}")
+        logger.warning(f"[DEBUG] p_embeds min/max/mean: {p_embeds.min().item():.4f} / {p_embeds.max().item():.4f} / {p_embeds.mean().item():.6f}")
+        logger.warning(f"[DEBUG] p_embeds abs_mean: {p_embeds.abs().mean().item():.6f}")
+        logger.warning(f"[DEBUG] n_embeds shape: {n_embeds.shape}, dtype: {n_embeds.dtype}")
+        logger.warning(f"[DEBUG] n_embeds min/max/mean: {n_embeds.min().item():.4f} / {n_embeds.max().item():.4f} / {n_embeds.mean().item():.6f}")
+        logger.warning(f"[DEBUG] target_device: {target_device}, target_dtype: {target_dtype}")
+        logger.warning(f"[DEBUG] positive keys: {list(positive[0][1].keys()) if len(positive[0]) > 1 else 'no dict'}")
+        # === END DEBUG ===
 
         input_image = None
         if image is not None:
