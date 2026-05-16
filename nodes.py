@@ -16,8 +16,9 @@ logger = logging.getLogger("[AsymFlow]")
 _pipe_cache = {}
 
 _ASYMFLUX2_KLEIN_CONFIG = {
-    "patch_size": 16,
-    "in_channels": 3,
+    "patch_size": 1,
+    "in_channels": 128,
+    "hidden_size": 4096,
     "base_rank": 128,
     "num_layers": 8,
     "num_single_layers": 24,
