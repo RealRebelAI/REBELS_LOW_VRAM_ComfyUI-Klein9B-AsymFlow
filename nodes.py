@@ -68,6 +68,10 @@ def _resolve_model_dir(folder_name, dir_name):
     raise FileNotFoundError(f"Directory '{dir_name}' not found in {folder_name}/ model folder.")
 
 def _cleanup_meta(model, dtype):
+    """
+    Cleans up any stranded meta tensors after weight assignment to prevent
+    NotImplementedError during CPU offloading.
+    """
     for module in model.modules():
         for name, param in module.named_parameters(recurse=False):
             if param is not None and param.device.type == "meta":
@@ -77,6 +81,46 @@ def _cleanup_meta(model, dtype):
             if buffer is not None and buffer.device.type == "meta":
                 new_buffer = torch.zeros_like(buffer, device="cpu", dtype=dtype)
                 module.register_buffer(name, new_buffer)
+
+def _merge_lora_weights(base_state_dict, lora_state_dict, dtype, scale=1.0):
+    """
+    Manually merges LoRA A and B matrices into the base state dictionary.
+    Bypasses PEFT load_lora_adapter to avoid meta-device instantiation.
+    """
+    logger.info("[AsymFlow] Merging LoRA weights directly into base state_dict...")
+    merged_count = 0
+    lora_keys = list(lora_state_dict.keys())
+    
+    # Group LoRA keys by their base parameter name
+    lora_groups = {}
+    for key in lora_keys:
+        if "lora_A" in key:
+            base_key = key.replace(".lora_A.weight", ".weight")
+            if base_key not in lora_groups:
+                lora_groups[base_key] = {}
+            lora_groups[base_key]["A"] = lora_state_dict[key]
+        elif "lora_B" in key:
+            base_key = key.replace(".lora_B.weight", ".weight")
+            if base_key not in lora_groups:
+                lora_groups[base_key] = {}
+            lora_groups[base_key]["B"] = lora_state_dict[key]
+
+    # Perform the matrix multiplication and addition
+    for base_key, matrices in lora_groups.items():
+        if base_key in base_state_dict and "A" in matrices and "B" in matrices:
+            lora_A = matrices["A"].to(dtype=torch.float32)
+            lora_B = matrices["B"].to(dtype=torch.float32)
+            base_weight = base_state_dict[base_key].to(dtype=torch.float32)
+
+            # Weight merge: W = W + (B @ A) * scale
+            delta = (lora_B @ lora_A) * scale
+            base_state_dict[base_key] = (base_weight + delta).to(dtype)
+            merged_count += 1
+        else:
+            logger.warning(f"[AsymFlow] Missing base key or partial LoRA matrices for {base_key}")
+
+    logger.info(f"[AsymFlow] Successfully merged {merged_count} LoRA modules.")
+    return base_state_dict
 
 class AsymFlux2KleinLoader:
     @classmethod
@@ -132,21 +176,23 @@ class AsymFlux2KleinLoader:
         for k, v in adapter_state_dict.items():
             k_clean = k.removeprefix("transformer.")
             if "lora" in k_clean:
-                lora_state_dict[k_clean] = v.to(dtype=torch_dtype)
+                lora_state_dict[k_clean] = v
             else:
                 overwrite_state_dict[k_clean] = v.to(dtype=torch_dtype)
 
         for k in base_state_dict:
             base_state_dict[k] = base_state_dict[k].to(dtype=torch_dtype)
+        
         base_state_dict.update(overwrite_state_dict)
+
+        # Merge LoRA before creating model
+        if lora_state_dict:
+            base_state_dict = _merge_lora_weights(base_state_dict, lora_state_dict, torch_dtype)
 
         with init_empty_weights():
             transformer_model = AsymFlux2Transformer2DModel(**_ASYMFLUX2_KLEIN_CONFIG)
 
         transformer_model.load_state_dict(base_state_dict, strict=False, assign=True)
-
-        if lora_state_dict:
-            transformer_model.load_lora_adapter(lora_state_dict, prefix=None, adapter_name="asymflow", low_cpu_mem_usage=True)
 
         te_subdir = os.path.join(te_dir, "text_encoder")
         tok_subdir = os.path.join(te_dir, "tokenizer")
@@ -270,21 +316,23 @@ class AsymFlux2KleinLoaderNoCLIP:
         for k, v in adapter_state_dict.items():
             k_clean = k.removeprefix("transformer.")
             if "lora" in k_clean:
-                lora_state_dict[k_clean] = v.to(dtype=torch_dtype)
+                lora_state_dict[k_clean] = v
             else:
                 overwrite_state_dict[k_clean] = v.to(dtype=torch_dtype)
 
         for k in base_state_dict:
             base_state_dict[k] = base_state_dict[k].to(dtype=torch_dtype)
+        
         base_state_dict.update(overwrite_state_dict)
+
+        # Merge LoRA before creating model
+        if lora_state_dict:
+            base_state_dict = _merge_lora_weights(base_state_dict, lora_state_dict, torch_dtype)
 
         with init_empty_weights():
             transformer_model = AsymFlux2Transformer2DModel(**_ASYMFLUX2_KLEIN_CONFIG)
 
         transformer_model.load_state_dict(base_state_dict, strict=False, assign=True)
-
-        if lora_state_dict:
-            transformer_model.load_lora_adapter(lora_state_dict, prefix=None, adapter_name="asymflow", low_cpu_mem_usage=True)
 
         pipe = PixelFlux2KleinPipeline(
             transformer=transformer_model,
@@ -295,7 +343,7 @@ class AsymFlux2KleinLoaderNoCLIP:
         )
 
         pipe = pipe.to(dtype=torch_dtype)
-        _cleanup_meta(pipe.transformer, torch_dtype) 
+        _cleanup_meta(pipe.transformer, torch_dtype)
         pipe.enable_sequential_cpu_offload()
 
         _pipe_cache[cache_key] = pipe
@@ -338,19 +386,20 @@ class AsymFlux2KleinLoaderGGUF:
         for k, v in adapter_state_dict.items():
             k_clean = k.removeprefix("transformer.")
             if "lora" in k_clean:
-                lora_state_dict[k_clean] = v.to(dtype=torch_dtype)
+                lora_state_dict[k_clean] = v
             else:
                 overwrite_state_dict[k_clean] = v.to(dtype=torch_dtype)
 
         base_state_dict.update(overwrite_state_dict)
 
+        # Merge LoRA before creating model
+        if lora_state_dict:
+            base_state_dict = _merge_lora_weights(base_state_dict, lora_state_dict, torch_dtype)
+
         with init_empty_weights():
             transformer_model = AsymFlux2Transformer2DModel(**_ASYMFLUX2_KLEIN_CONFIG)
 
         transformer_model.load_state_dict(base_state_dict, strict=False, assign=True)
-
-        if lora_state_dict:
-            transformer_model.load_lora_adapter(lora_state_dict, prefix=None, adapter_name="asymflow", low_cpu_mem_usage=True)
 
         pipe = PixelFlux2KleinPipeline(
             transformer=transformer_model,
@@ -361,7 +410,7 @@ class AsymFlux2KleinLoaderGGUF:
         )
 
         pipe = pipe.to(dtype=torch_dtype)
-        _cleanup_meta(pipe.transformer, torch_dtype) 
+        _cleanup_meta(pipe.transformer, torch_dtype)
         pipe.enable_sequential_cpu_offload()
 
         return (pipe,)
@@ -398,16 +447,15 @@ class AsymFlux2KleinCondSampler:
         target_dtype = pipe.transformer.dtype
         target_device = pipe._execution_device
 
-        # EXTRACT BOTH SEQUENCE AND POOLED EMBEDDINGS
+        # Keep NaN sanitization just in case for FP4/FP8 safety
         p_embeds = positive[0][0].to(target_device).to(target_dtype)
-        p_pooled = positive[0][1]["pooled_output"].to(target_device).to(target_dtype)
+        p_embeds = torch.nan_to_num(p_embeds, nan=0.0, posinf=10.0, neginf=-10.0)
 
         if negative is not None:
             n_embeds = negative[0][0].to(target_device).to(target_dtype)
-            n_pooled = negative[0][1]["pooled_output"].to(target_device).to(target_dtype)
+            n_embeds = torch.nan_to_num(n_embeds, nan=0.0, posinf=10.0, neginf=-10.0)
         else:
             n_embeds = torch.zeros_like(p_embeds)
-            n_pooled = torch.zeros_like(p_pooled)
 
         input_image = None
         if image is not None:
@@ -419,10 +467,8 @@ class AsymFlux2KleinCondSampler:
         result = pipe(
             prompt=None,
             prompt_embeds=p_embeds,
-            pooled_prompt_embeds=p_pooled,
             negative_prompt=None,
             negative_prompt_embeds=n_embeds,
-            negative_pooled_prompt_embeds=n_pooled,
             image=input_image,
             width=width,
             height=height,
