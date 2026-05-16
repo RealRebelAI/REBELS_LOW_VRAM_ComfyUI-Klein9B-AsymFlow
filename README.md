@@ -36,7 +36,7 @@ Example: [`example_workflows/asymflux2_t2i.json`](example_workflows/asymflux2_t2
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/Nynxz/ComfyUI-AsymFLUX2
+git clone https://github.com/RealRebelAI/REBELS_LOW_VRAM_ComfyUI-Klein9B-AsymFlow.git
 ```
 
 No extra Python deps.
