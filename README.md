@@ -1,6 +1,9 @@
 # REBELS_LOW_VRAM_ComfyUI-Klein9B-AsymFlow
 
 ## ADDED PIXEL SMOOTH NODE TO REMOVE TILING!
+<img width="535" height="511" alt="Screenshot (122)" src="https://github.com/user-attachments/assets/a0a0496e-4f4a-47dc-8d04-817dacceda4d" />
+
+
 
 
 ComfyUI nodes for running [AsymFLUX.2-klein](https://huggingface.co/Lakonik/AsymFLUX.2-klein-9B)
